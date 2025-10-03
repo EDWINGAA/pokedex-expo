@@ -2,7 +2,7 @@ import 'react-native-gesture-handler';
 import React, { useEffect, useMemo, useState, useCallback, useContext, createContext } from 'react';
 import {
   View, Text, StyleSheet, FlatList, Image, TouchableOpacity, TextInput,
-  ActivityIndicator, RefreshControl, SafeAreaView, Dimensions, Platform, Alert,
+  ActivityIndicator, RefreshControl, SafeAreaView, Dimensions, Platform, Alert, KeyboardAvoidingView, ScrollView
 } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
@@ -58,10 +58,9 @@ function priceWithSale(base, pct) {
   return parseFloat((base * (1 - pct / 100)).toFixed(2));
 }
 
-// ====== FAVORITOS (Context + Persistencia, en JS) ======
-/** Estructura GameCard (referencia):
- * { id, name, image, metacritic, released, price, salePct, finalPrice }
- */
+/** =========================
+ *     FAVORITOS CONTEXT
+ *  ========================= */
 const FavoritesContext = createContext(null);
 const FAVORITES_KEY = 'FAVORITES_GAMES_V1';
 
@@ -70,11 +69,9 @@ function useFavorites() {
   if (!ctx) throw new Error('useFavorites debe usarse dentro de FavoritesProvider');
   return ctx;
 }
-
 function FavoritesProvider({ children }) {
   const [favorites, setFavorites] = useState([]);
 
-  // cargar al inicio
   useEffect(() => {
     (async () => {
       try {
@@ -83,34 +80,21 @@ function FavoritesProvider({ children }) {
       } catch {}
     })();
   }, []);
-
-  // persistir cambios
   useEffect(() => {
     AsyncStorage.setItem(FAVORITES_KEY, JSON.stringify(favorites)).catch(() => {});
   }, [favorites]);
 
   const isFavorite = (id) => favorites.some((f) => f.id === id);
-
   const toggleFavorite = (game) => {
     setFavorites((prev) => {
       const exists = prev.some((g) => g.id === game.id);
       if (exists) return prev.filter((g) => g.id !== game.id);
-      return [
-        ...prev,
-        {
-          id: game.id,
-          name: game.name,
-          image: game.image,
-          metacritic: game.metacritic,
-          released: game.released,
-          price: game.price,
-          salePct: game.salePct,
-          finalPrice: game.finalPrice,
-        },
-      ];
+      return [...prev, {
+        id: game.id, name: game.name, image: game.image, metacritic: game.metacritic,
+        released: game.released, price: game.price, salePct: game.salePct, finalPrice: game.finalPrice,
+      }];
     });
   };
-
   const removeFavorite = (id) => setFavorites((prev) => prev.filter((g) => g.id !== id));
 
   return (
@@ -120,7 +104,57 @@ function FavoritesProvider({ children }) {
   );
 }
 
-// ====== HOME ======
+/** ======================
+ *       AUTH CONTEXT
+ *  ====================== */
+const AuthContext = createContext(null);
+const AUTH_KEY = 'AUTH_USER_V1';
+
+function useAuth() {
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error('useAuth debe usarse dentro de AuthProvider');
+  return ctx;
+}
+
+function AuthProvider({ children }) {
+  const [user, setUser] = useState(null);
+  const [booting, setBooting] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem(AUTH_KEY);
+        if (raw) setUser(JSON.parse(raw));
+      } catch {}
+      setBooting(false);
+    })();
+  }, []);
+
+  const login = async (email, password) => {
+    // DEMO: valida formato básico y password con al menos 4 chars
+    if (!email || !email.includes('@')) throw new Error('Email inválido');
+    if (!password || password.length < 4) throw new Error('La contraseña debe tener 4+ caracteres');
+
+    const newUser = { email, name: email.split('@')[0] };
+    setUser(newUser);
+    await AsyncStorage.setItem(AUTH_KEY, JSON.stringify(newUser));
+  };
+
+  const logout = async () => {
+    setUser(null);
+    await AsyncStorage.removeItem(AUTH_KEY);
+  };
+
+  return (
+    <AuthContext.Provider value={{ user, login, logout, booting }}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+/** ======================
+ *        HOME
+ *  ====================== */
 function HomeScreen({ navigation }) {
   const [all, setAll] = useState([]);
   const [query, setQuery] = useState('');
@@ -130,6 +164,7 @@ function HomeScreen({ navigation }) {
   const [showOffers, setShowOffers] = useState(false);
 
   const { favorites, isFavorite, toggleFavorite } = useFavorites();
+  const { user } = useAuth();
 
   const fetchGames = async (searchText = '') => {
     setError(null);
@@ -168,9 +203,7 @@ function HomeScreen({ navigation }) {
     }
   };
 
-  useEffect(() => {
-    fetchGames();
-  }, []);
+  useEffect(() => { fetchGames(); }, []);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -187,12 +220,23 @@ function HomeScreen({ navigation }) {
   }, [all, query, showOffers]);
 
   const handleBuy = (game) => {
+    if (!user) {
+      Alert.alert(
+        'Necesitas iniciar sesión',
+        'Para comprar debes iniciar sesión.',
+        [
+          { text: 'Cancelar', style: 'cancel' },
+          { text: 'Iniciar sesión', onPress: () => navigation.navigate('Login') },
+        ]
+      );
+      return;
+    }
     Alert.alert(
       'Comprar en ENEBO',
       `${game.name}\n\nPrecio: $${game.finalPrice.toFixed(2)} USD`,
       [
         { text: 'Cancelar', style: 'cancel' },
-        { text: 'Confirmar', onPress: () => Alert.alert('¡Listo!', 'Compra simulada 😄') },
+        { text: 'Confirmar', onPress: () => Alert.alert('¡Listo!', `Gracias ${user.name} 😄`) },
       ]
     );
   };
@@ -266,12 +310,7 @@ function HomeScreen({ navigation }) {
   if (loading) {
     return (
       <SafeAreaView style={styles.container}>
-        <HomeHeader
-          navigation={navigation}
-          showOffers={showOffers}
-          onToggleOffers={() => setShowOffers((s) => !s)}
-          favCount={favCount}
-        />
+        <HomeHeader navigation={navigation} showOffers={showOffers} onToggleOffers={() => setShowOffers((s) => !s)} favCount={favCount} />
         <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
           <ActivityIndicator size="large" />
           <Text style={{ marginTop: 12, color: '#bbb' }}>Cargando juegos…</Text>
@@ -284,12 +323,7 @@ function HomeScreen({ navigation }) {
   if (error) {
     return (
       <SafeAreaView style={styles.container}>
-        <HomeHeader
-          navigation={navigation}
-          showOffers={showOffers}
-          onToggleOffers={() => setShowOffers((s) => !s)}
-          favCount={favCount}
-        />
+        <HomeHeader navigation={navigation} showOffers={showOffers} onToggleOffers={() => setShowOffers((s) => !s)} favCount={favCount} />
         <View style={{ padding: 16 }}>
           <Text style={{ color: '#ff7b7b', fontWeight: '700', marginBottom: 8 }}>Error: {error}</Text>
           <TouchableOpacity onPress={() => fetchGames(query)} style={styles.retryBtn}>
@@ -303,12 +337,7 @@ function HomeScreen({ navigation }) {
 
   return (
     <SafeAreaView style={styles.container}>
-      <HomeHeader
-        navigation={navigation}
-        showOffers={showOffers}
-        onToggleOffers={() => setShowOffers((s) => !s)}
-        favCount={favCount}
-      />
+      <HomeHeader navigation={navigation} showOffers={showOffers} onToggleOffers={() => setShowOffers((s) => !s)} favCount={favCount} />
 
       <View style={styles.searchWrap}>
         <MaterialCommunityIcons name="magnify" size={20} color="#98a2b3" style={{ marginRight: 8 }} />
@@ -316,10 +345,7 @@ function HomeScreen({ navigation }) {
           placeholder="Buscar juegos (ej. Elden Ring, Hades, GTA)"
           placeholderTextColor="#98a2b3"
           value={query}
-          onChangeText={(t) => {
-            setQuery(t);
-            fetchGames(t);
-          }}
+          onChangeText={(t) => { setQuery(t); fetchGames(t); }}
           style={styles.search}
           autoCapitalize="none"
           autoCorrect={false}
@@ -349,8 +375,27 @@ function HomeScreen({ navigation }) {
   );
 }
 
-// ===== Header =====
+/** ======================
+ *        HEADER
+ *  ====================== */
 function HomeHeader({ showOffers, onToggleOffers, navigation, favCount = 0 }) {
+  const { user, logout } = useAuth();
+
+  const onPressAccount = () => {
+    if (!user) {
+      navigation.navigate('Login');
+    } else {
+      Alert.alert(
+        'Cuenta',
+        `${user.email}`,
+        [
+          { text: 'Cerrar sesión', style: 'destructive', onPress: logout },
+          { text: 'Cancelar', style: 'cancel' },
+        ]
+      );
+    }
+  };
+
   return (
     <LinearGradient colors={['#0f0c29', '#302b63', '#24243e']} start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }} style={styles.headerGrad}>
       <View style={styles.headerLeft}>
@@ -361,6 +406,7 @@ function HomeHeader({ showOffers, onToggleOffers, navigation, favCount = 0 }) {
       </View>
 
       <View style={styles.headerRight}>
+        {/* Ofertas toggle */}
         <TouchableOpacity
           activeOpacity={0.9}
           onPress={onToggleOffers}
@@ -370,11 +416,13 @@ function HomeHeader({ showOffers, onToggleOffers, navigation, favCount = 0 }) {
           <Text style={[styles.tagTxt, showOffers && { color: '#22c55e' }]}>Ofertas</Text>
         </TouchableOpacity>
 
-        <View style={[styles.tag, { backgroundColor: '#2dd4bf22', borderColor: '#2dd4bf55' }]}>
-          <MaterialCommunityIcons name="shield-star" size={14} color="#2dd4bf" />
-          <Text style={[styles.tagTxt, { color: '#2dd4bf' }]}>Top</Text>
-        </View>
+        {/* Reemplazo del botón "Top" por Login/Cuenta */}
+        <TouchableOpacity activeOpacity={0.9} style={styles.tag} onPress={onPressAccount}>
+          <MaterialCommunityIcons name="account" size={16} color="#fff" />
+          <Text style={styles.tagTxt}>{user ? 'Cuenta' : 'Entrar'}</Text>
+        </TouchableOpacity>
 
+        {/* Favoritos */}
         <TouchableOpacity activeOpacity={0.9} style={styles.favHeaderBtn} onPress={() => navigation.navigate('Favorites')}>
           <MaterialCommunityIcons name="heart" size={18} color="#fff" />
           {favCount > 0 && (
@@ -388,8 +436,10 @@ function HomeHeader({ showOffers, onToggleOffers, navigation, favCount = 0 }) {
   );
 }
 
-// ===== DETAILS =====
-function DetailsScreen({ route }) {
+/** ======================
+ *       DETAILS
+ *  ====================== */
+function DetailsScreen({ route, navigation }) {
   const { id, name } = route.params;
   const [details, setDetails] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -399,15 +449,27 @@ function DetailsScreen({ route }) {
   const finalPrice = off ? priceWithSale(price, off) : price;
 
   const { isFavorite, toggleFavorite } = useFavorites();
+  const { user } = useAuth();
   const fav = isFavorite(id);
 
   const handleBuy = () => {
+    if (!user) {
+      Alert.alert(
+        'Necesitas iniciar sesión',
+        'Para comprar debes iniciar sesión.',
+        [
+          { text: 'Cancelar', style: 'cancel' },
+          { text: 'Iniciar sesión', onPress: () => navigation.navigate('Login') },
+        ]
+      );
+      return;
+    }
     Alert.alert(
       'Comprar en ENEBO',
       `${name}\n\nPrecio: $${finalPrice.toFixed(2)} USD`,
       [
         { text: 'Cancelar', style: 'cancel' },
-        { text: 'Confirmar', onPress: () => Alert.alert('¡Listo!', 'Compra simulada 😄') },
+        { text: 'Confirmar', onPress: () => Alert.alert('¡Listo!', `Gracias ${user.name} 😄`) },
       ]
     );
   };
@@ -431,14 +493,10 @@ function DetailsScreen({ route }) {
   const img = details?.game?.background_image || details?.game?.background_image_additional;
 
   const compactGame = {
-    id,
-    name,
-    image: img,
+    id, name, image: img,
     metacritic: details?.game?.metacritic,
     released: details?.game?.released,
-    price,
-    salePct: off,
-    finalPrice,
+    price, salePct: off, finalPrice,
   };
 
   return (
@@ -494,10 +552,7 @@ function DetailsScreen({ route }) {
           <View style={styles.infoGrid}>
             <InfoBlock label="Lanzamiento" value={details.game.released || '—'} />
             <InfoBlock label="Metacritic" value={String(details.game.metacritic ?? '—')} />
-            <InfoBlock
-              label="Plataformas"
-              value={(details.game.platforms || []).map((p) => p.platform.name).join(', ') || '—'}
-            />
+            <InfoBlock label="Plataformas" value={(details.game.platforms || []).map((p) => p.platform.name).join(', ') || '—'} />
             <InfoBlock label="Rating RAWG" value={String(details.game.rating ?? '—')} />
           </View>
 
@@ -516,7 +571,9 @@ function DetailsScreen({ route }) {
   );
 }
 
-// ===== FAVORITES SCREEN =====
+/** ======================
+ *      FAVORITES
+ *  ====================== */
 function FavoritesScreen({ navigation }) {
   const { favorites, toggleFavorite } = useFavorites();
 
@@ -533,11 +590,7 @@ function FavoritesScreen({ navigation }) {
       );
 
     return (
-      <TouchableOpacity
-        activeOpacity={0.9}
-        onPress={() => navigation.navigate('Details', { id: item.id, name: item.name })}
-        style={{ width: CARD_W }}
-      >
+      <TouchableOpacity activeOpacity={0.9} onPress={() => navigation.navigate('Details', { id: item.id, name: item.name })} style={{ width: CARD_W }}>
         <View style={styles.card}>
           <LinearGradient colors={[c1, c2]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.cardBanner}>
             <View style={styles.metacriticPill}>
@@ -617,7 +670,80 @@ function FavoritesScreen({ navigation }) {
   );
 }
 
-// ===== UI bits =====
+/** ======================
+ *        LOGIN
+ *  ====================== */
+function LoginScreen({ navigation }) {
+  const { user, login } = useAuth();
+  const [email, setEmail] = useState(user?.email || '');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const onSubmit = async () => {
+    setErr(null);
+    try {
+      setBusy(true);
+      await login(email.trim(), password);
+      Alert.alert('¡Bienvenido!', 'Sesión iniciada correctamente', [
+        { text: 'OK', onPress: () => navigation.goBack() },
+      ]);
+    } catch (e) {
+      setErr(e.message || 'Error al iniciar sesión');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <SafeAreaView style={{ flex: 1, backgroundColor: '#0b0b0e' }}>
+      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ flex: 1 }}>
+        <ScrollView contentContainerStyle={{ padding: 16 }}>
+          <LinearGradient colors={['#0f0c29', '#302b63', '#24243e']} style={styles.detailHeader}>
+            <Text style={styles.detailTitle}>Iniciar sesión</Text>
+          </LinearGradient>
+
+          <View style={{ marginTop: 16, backgroundColor: '#0f1222', borderRadius: 12, padding: 16, borderWidth: StyleSheet.hairlineWidth, borderColor: '#1f2540' }}>
+            <Text style={{ color: '#94a3b8', marginBottom: 6, fontWeight: '700' }}>Email</Text>
+            <TextInput
+              value={email}
+              onChangeText={setEmail}
+              autoCapitalize="none"
+              keyboardType="email-address"
+              placeholder="tu@correo.com"
+              placeholderTextColor="#6b7280"
+              style={styles.input}
+            />
+            <Text style={{ color: '#94a3b8', marginTop: 12, marginBottom: 6, fontWeight: '700' }}>Contraseña</Text>
+            <TextInput
+              value={password}
+              onChangeText={setPassword}
+              secureTextEntry
+              placeholder="••••"
+              placeholderTextColor="#6b7280"
+              style={styles.input}
+            />
+            {err ? <Text style={{ color: '#ff7b7b', marginTop: 10, fontWeight: '700' }}>{err}</Text> : null}
+
+            <TouchableOpacity style={[styles.buyBtn, { alignSelf: 'flex-start', marginTop: 16, paddingHorizontal: 18 }]} onPress={onSubmit} disabled={busy}>
+              {busy ? <ActivityIndicator /> : <MaterialCommunityIcons name="login" size={18} color="#0b0b0e" />}
+              <Text style={styles.buyTxt}>{busy ? 'Ingresando…' : 'Entrar'}</Text>
+            </TouchableOpacity>
+
+            <Text style={{ color: '#94a3b8', marginTop: 14, fontSize: 12 }}>
+              Demo: cualquier email válido y una contraseña de 4+ caracteres.
+            </Text>
+          </View>
+        </ScrollView>
+      </KeyboardAvoidingView>
+      <StatusBar style="light" />
+    </SafeAreaView>
+  );
+}
+
+/** ======================
+ *         UI bits
+ *  ====================== */
 function InfoBlock({ label, value }) {
   return (
     <View style={styles.infoBlock}>
@@ -627,42 +753,63 @@ function InfoBlock({ label, value }) {
   );
 }
 
-// ===== Root =====
+/** ======================
+ *          ROOT
+ *  ====================== */
 export default function App() {
   return (
-    <FavoritesProvider>
-      <NavigationContainer>
-        <Stack.Navigator
-          screenOptions={{
-            headerShown: false,
-            contentStyle: { backgroundColor: '#0b0b0e' },
-            animation: Platform.select({ ios: 'default', android: 'fade' }),
-          }}
-        >
-          <Stack.Screen name="Home" component={HomeScreen} />
-          <Stack.Screen
-            name="Details"
-            component={DetailsScreen}
-            options={({ route }) => ({
-              headerShown: true,
-              title: route.params?.name || 'Detalle',
-              headerTitleAlign: 'center',
-              headerBackTitleVisible: false,
-              headerShadowVisible: false,
-              headerStyle: { backgroundColor: '#fff' },
-              headerTintColor: '#111',
-              headerTitleStyle: { fontWeight: '700' },
-              gestureEnabled: true,
-            })}
-          />
-          <Stack.Screen name="Favorites" component={FavoritesScreen} options={{ headerShown: false }} />
-        </Stack.Navigator>
-      </NavigationContainer>
-    </FavoritesProvider>
+    <AuthProvider>
+      <FavoritesProvider>
+        <NavigationContainer>
+          <Stack.Navigator
+            screenOptions={{
+              headerShown: false,
+              contentStyle: { backgroundColor: '#0b0b0e' },
+              animation: Platform.select({ ios: 'default', android: 'fade' }),
+            }}
+          >
+            <Stack.Screen name="Home" component={HomeScreen} />
+            <Stack.Screen
+              name="Details"
+              component={DetailsScreen}
+              options={({ route }) => ({
+                headerShown: true,
+                title: route.params?.name || 'Detalle',
+                headerTitleAlign: 'center',
+                headerBackTitleVisible: false,
+                headerShadowVisible: false,
+                headerStyle: { backgroundColor: '#fff' },
+                headerTintColor: '#111',
+                headerTitleStyle: { fontWeight: '700' },
+                gestureEnabled: true,
+              })}
+            />
+            <Stack.Screen name="Favorites" component={FavoritesScreen} options={{ headerShown: false }} />
+            <Stack.Screen
+              name="Login"
+              component={LoginScreen}
+              options={{
+                headerShown: true,
+                title: 'Login',
+                headerTitleAlign: 'center',
+                headerBackTitleVisible: false,
+                headerShadowVisible: false,
+                headerStyle: { backgroundColor: '#fff' },
+                headerTintColor: '#111',
+                headerTitleStyle: { fontWeight: '700' },
+                gestureEnabled: true,
+              }}
+            />
+          </Stack.Navigator>
+        </NavigationContainer>
+      </FavoritesProvider>
+    </AuthProvider>
   );
 }
 
-// ===== Styles =====
+/** ======================
+ *        STYLES
+ *  ====================== */
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0b0b0e' },
 
@@ -790,4 +937,15 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth, borderColor: '#0d9488',
   },
   offerTxtBig: { color: '#10b981', fontWeight: '900' },
+
+  // Login inputs
+  input: {
+    backgroundColor: '#0b0b0e',
+    color: '#e5e7eb',
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: '#1f2540',
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: Platform.select({ ios: 12, android: 8 }),
+  },
 });
