@@ -1,32 +1,21 @@
 import 'react-native-gesture-handler';
-import React, { useEffect, useMemo, useState, useCallback } from 'react';
+import React, { useEffect, useMemo, useState, useCallback, useContext, createContext } from 'react';
 import {
-  View,
-  Text,
-  StyleSheet,
-  FlatList,
-  Image,
-  TouchableOpacity,
-  TextInput,
-  ActivityIndicator,
-  RefreshControl,
-  SafeAreaView,
-  Dimensions,
-  Platform,
-  Alert,
+  View, Text, StyleSheet, FlatList, Image, TouchableOpacity, TextInput,
+  ActivityIndicator, RefreshControl, SafeAreaView, Dimensions, Platform, Alert,
 } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { LinearGradient } from 'expo-linear-gradient';
 import { StatusBar } from 'expo-status-bar';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const Stack = createNativeStackNavigator();
 
 // ===== Config / APIs =====
 const RAWG_API = 'https://api.rawg.io/api';
-const RAWG_KEY = '5eee14f8e4454a299c2e8110d7c8589f'; // tu key
-// (CheapShark se puede re-activar luego si deseas precios reales PC)
+const RAWG_KEY = '5eee14f8e4454a299c2e8110d7c8589f';
 
 // ===== Layout helpers =====
 const { width: SCREEN_W } = Dimensions.get('window');
@@ -34,7 +23,7 @@ const H_PADDING = 12;
 const GAP = 12;
 const COLS = 2;
 const CARD_W = Math.floor((SCREEN_W - H_PADDING * 2 - GAP * (COLS - 1)) / COLS);
-const CARD_H = 290; // un poquito más alto para precio y botón
+const CARD_H = 290;
 
 const pad3 = (n) => `#${String(n).padStart(3, '0')}`;
 
@@ -48,22 +37,16 @@ const PALETTE = [
 ];
 const gradientById = (id) => PALETTE[id % PALETTE.length];
 
-// ====== PRICING helpers (precios inventados pero consistentes) ======
+// ====== PRICING helpers ======
 function pseudoRand(n) {
-  // simple hash determinista por id
   let x = Math.sin(n) * 10000;
   return x - Math.floor(x);
 }
-
 function basePriceFor(id) {
-  // precio entre 14.99 y 74.99
-  const p = 14.99 + Math.floor(pseudoRand(id) * 60); // 0..59
-  // ajustamos a .99
+  const p = 14.99 + Math.floor(pseudoRand(id) * 60);
   return parseFloat((p + 0.99).toFixed(2));
 }
-
 function saleFor(id) {
-  // ~35% de juegos con oferta; descuento entre 10% y 60%
   const r = pseudoRand(id * 3.7);
   if (r < 0.35) {
     const pct = 10 + Math.floor(pseudoRand(id * 9.1) * 50); // 10..59
@@ -71,9 +54,70 @@ function saleFor(id) {
   }
   return null;
 }
-
 function priceWithSale(base, pct) {
   return parseFloat((base * (1 - pct / 100)).toFixed(2));
+}
+
+// ====== FAVORITOS (Context + Persistencia, en JS) ======
+/** Estructura GameCard (referencia):
+ * { id, name, image, metacritic, released, price, salePct, finalPrice }
+ */
+const FavoritesContext = createContext(null);
+const FAVORITES_KEY = 'FAVORITES_GAMES_V1';
+
+function useFavorites() {
+  const ctx = useContext(FavoritesContext);
+  if (!ctx) throw new Error('useFavorites debe usarse dentro de FavoritesProvider');
+  return ctx;
+}
+
+function FavoritesProvider({ children }) {
+  const [favorites, setFavorites] = useState([]);
+
+  // cargar al inicio
+  useEffect(() => {
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem(FAVORITES_KEY);
+        if (raw) setFavorites(JSON.parse(raw));
+      } catch {}
+    })();
+  }, []);
+
+  // persistir cambios
+  useEffect(() => {
+    AsyncStorage.setItem(FAVORITES_KEY, JSON.stringify(favorites)).catch(() => {});
+  }, [favorites]);
+
+  const isFavorite = (id) => favorites.some((f) => f.id === id);
+
+  const toggleFavorite = (game) => {
+    setFavorites((prev) => {
+      const exists = prev.some((g) => g.id === game.id);
+      if (exists) return prev.filter((g) => g.id !== game.id);
+      return [
+        ...prev,
+        {
+          id: game.id,
+          name: game.name,
+          image: game.image,
+          metacritic: game.metacritic,
+          released: game.released,
+          price: game.price,
+          salePct: game.salePct,
+          finalPrice: game.finalPrice,
+        },
+      ];
+    });
+  };
+
+  const removeFavorite = (id) => setFavorites((prev) => prev.filter((g) => g.id !== id));
+
+  return (
+    <FavoritesContext.Provider value={{ favorites, isFavorite, toggleFavorite, removeFavorite }}>
+      {children}
+    </FavoritesContext.Provider>
+  );
 }
 
 // ====== HOME ======
@@ -84,6 +128,8 @@ function HomeScreen({ navigation }) {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(null);
   const [showOffers, setShowOffers] = useState(false);
+
+  const { favorites, isFavorite, toggleFavorite } = useFavorites();
 
   const fetchGames = async (searchText = '') => {
     setError(null);
@@ -101,7 +147,7 @@ function HomeScreen({ navigation }) {
 
       const mapped = (json.results || []).map((g) => {
         const price = basePriceFor(g.id);
-        const off = saleFor(g.id); // null o %
+        const off = saleFor(g.id);
         const final = off ? priceWithSale(price, off) : price;
         return {
           id: g.id,
@@ -135,12 +181,8 @@ function HomeScreen({ navigation }) {
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     let arr = all;
-    if (q) {
-      arr = arr.filter((g) => g.name.toLowerCase().includes(q) || String(g.id) === q);
-    }
-    if (showOffers) {
-      arr = arr.filter((g) => g.salePct && g.salePct > 0);
-    }
+    if (q) arr = arr.filter((g) => g.name.toLowerCase().includes(q) || String(g.id) === q);
+    if (showOffers) arr = arr.filter((g) => g.salePct && g.salePct > 0);
     return arr;
   }, [all, query, showOffers]);
 
@@ -157,6 +199,8 @@ function HomeScreen({ navigation }) {
 
   const renderItem = ({ item }) => {
     const [c1, c2] = gradientById(item.id);
+    const fav = isFavorite(item.id);
+
     return (
       <TouchableOpacity
         activeOpacity={0.9}
@@ -164,7 +208,6 @@ function HomeScreen({ navigation }) {
         style={{ width: CARD_W }}
       >
         <View style={styles.card}>
-          {/* Banner con gradiente + etiquetas */}
           <LinearGradient colors={[c1, c2]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.cardBanner}>
             <View style={styles.metacriticPill}>
               <MaterialCommunityIcons name="star-circle" size={14} color="#fff" />
@@ -181,19 +224,22 @@ function HomeScreen({ navigation }) {
             <Text style={styles.cardId}>{pad3(item.id)}</Text>
           </LinearGradient>
 
-          {/* Imagen */}
-          <Image
-            source={{ uri: item.image }}
-            style={styles.cardImage}
-            resizeMode="cover"
-          />
+          <View>
+            <Image source={{ uri: item.image }} style={styles.cardImage} resizeMode="cover" />
+            {/* Botón corazón */}
+            <TouchableOpacity onPress={() => toggleFavorite(item)} activeOpacity={0.8} style={styles.heartBtn}>
+              <MaterialCommunityIcons
+                name={fav ? 'heart' : 'heart-outline'}
+                size={20}
+                color={fav ? '#ef4444' : '#e5e7eb'}
+              />
+            </TouchableOpacity>
+          </View>
 
-          {/* Info */}
           <View style={styles.cardInfo}>
             <Text style={styles.cardName} numberOfLines={1}>{item.name}</Text>
             <Text style={styles.cardReleased} numberOfLines={1}>{item.released || '—'}</Text>
 
-            {/* Precio */}
             <View style={styles.priceRow}>
               {item.salePct ? (
                 <>
@@ -205,7 +251,6 @@ function HomeScreen({ navigation }) {
               )}
             </View>
 
-            {/* Comprar */}
             <TouchableOpacity style={styles.buyBtn} onPress={() => handleBuy(item)}>
               <MaterialCommunityIcons name="cart" size={16} color="#0b0b0e" />
               <Text style={styles.buyTxt}>Comprar</Text>
@@ -216,10 +261,17 @@ function HomeScreen({ navigation }) {
     );
   };
 
+  const favCount = useFavorites().favorites.length;
+
   if (loading) {
     return (
       <SafeAreaView style={styles.container}>
-        <HomeHeader showOffers={showOffers} onToggleOffers={() => setShowOffers((s) => !s)} />
+        <HomeHeader
+          navigation={navigation}
+          showOffers={showOffers}
+          onToggleOffers={() => setShowOffers((s) => !s)}
+          favCount={favCount}
+        />
         <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
           <ActivityIndicator size="large" />
           <Text style={{ marginTop: 12, color: '#bbb' }}>Cargando juegos…</Text>
@@ -232,7 +284,12 @@ function HomeScreen({ navigation }) {
   if (error) {
     return (
       <SafeAreaView style={styles.container}>
-        <HomeHeader showOffers={showOffers} onToggleOffers={() => setShowOffers((s) => !s)} />
+        <HomeHeader
+          navigation={navigation}
+          showOffers={showOffers}
+          onToggleOffers={() => setShowOffers((s) => !s)}
+          favCount={favCount}
+        />
         <View style={{ padding: 16 }}>
           <Text style={{ color: '#ff7b7b', fontWeight: '700', marginBottom: 8 }}>Error: {error}</Text>
           <TouchableOpacity onPress={() => fetchGames(query)} style={styles.retryBtn}>
@@ -246,7 +303,12 @@ function HomeScreen({ navigation }) {
 
   return (
     <SafeAreaView style={styles.container}>
-      <HomeHeader showOffers={showOffers} onToggleOffers={() => setShowOffers((s) => !s)} />
+      <HomeHeader
+        navigation={navigation}
+        showOffers={showOffers}
+        onToggleOffers={() => setShowOffers((s) => !s)}
+        favCount={favCount}
+      />
 
       <View style={styles.searchWrap}>
         <MaterialCommunityIcons name="magnify" size={20} color="#98a2b3" style={{ marginRight: 8 }} />
@@ -287,15 +349,10 @@ function HomeScreen({ navigation }) {
   );
 }
 
-// ===== Header Gamer (ENEBO) =====
-function HomeHeader({ showOffers, onToggleOffers }) {
+// ===== Header =====
+function HomeHeader({ showOffers, onToggleOffers, navigation, favCount = 0 }) {
   return (
-    <LinearGradient
-      colors={['#0f0c29', '#302b63', '#24243e']}
-      start={{ x: 0, y: 0 }}
-      end={{ x: 1, y: 0 }}
-      style={styles.headerGrad}
-    >
+    <LinearGradient colors={['#0f0c29', '#302b63', '#24243e']} start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }} style={styles.headerGrad}>
       <View style={styles.headerLeft}>
         <View style={styles.logoCircle}>
           <MaterialCommunityIcons name="controller-classic" size={22} color="#fff" />
@@ -304,29 +361,28 @@ function HomeHeader({ showOffers, onToggleOffers }) {
       </View>
 
       <View style={styles.headerRight}>
-        {/* Botón Ofertas funcional */}
         <TouchableOpacity
           activeOpacity={0.9}
           onPress={onToggleOffers}
-          style={[
-            styles.tag,
-            showOffers && { backgroundColor: '#22c55e22', borderColor: '#22c55e66' },
-          ]}
+          style={[styles.tag, showOffers && { backgroundColor: '#22c55e22', borderColor: '#22c55e66' }]}
         >
-          <MaterialCommunityIcons
-            name="tag-multiple"
-            size={14}
-            color={showOffers ? '#22c55e' : '#fff'}
-          />
-          <Text style={[styles.tagTxt, showOffers && { color: '#22c55e' }]}>
-            Ofertas
-          </Text>
+          <MaterialCommunityIcons name="tag-multiple" size={14} color={showOffers ? '#22c55e' : '#fff'} />
+          <Text style={[styles.tagTxt, showOffers && { color: '#22c55e' }]}>Ofertas</Text>
         </TouchableOpacity>
 
         <View style={[styles.tag, { backgroundColor: '#2dd4bf22', borderColor: '#2dd4bf55' }]}>
           <MaterialCommunityIcons name="shield-star" size={14} color="#2dd4bf" />
           <Text style={[styles.tagTxt, { color: '#2dd4bf' }]}>Top</Text>
         </View>
+
+        <TouchableOpacity activeOpacity={0.9} style={styles.favHeaderBtn} onPress={() => navigation.navigate('Favorites')}>
+          <MaterialCommunityIcons name="heart" size={18} color="#fff" />
+          {favCount > 0 && (
+            <View style={styles.favBadge}>
+              <Text style={styles.favBadgeTxt}>{favCount > 99 ? '99+' : favCount}</Text>
+            </View>
+          )}
+        </TouchableOpacity>
       </View>
     </LinearGradient>
   );
@@ -341,6 +397,9 @@ function DetailsScreen({ route }) {
   const price = basePriceFor(id);
   const off = saleFor(id);
   const finalPrice = off ? priceWithSale(price, off) : price;
+
+  const { isFavorite, toggleFavorite } = useFavorites();
+  const fav = isFavorite(id);
 
   const handleBuy = () => {
     Alert.alert(
@@ -371,12 +430,30 @@ function DetailsScreen({ route }) {
   const [c1, c2] = gradientById(id);
   const img = details?.game?.background_image || details?.game?.background_image_additional;
 
+  const compactGame = {
+    id,
+    name,
+    image: img,
+    metacritic: details?.game?.metacritic,
+    released: details?.game?.released,
+    price,
+    salePct: off,
+    finalPrice,
+  };
+
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: '#0b0b0e' }}>
       <LinearGradient colors={[c1, c2]} style={styles.detailHeader}>
-        <Text style={styles.detailTitle}>
-          {name} <Text style={styles.detailId}>{pad3(id)}</Text>
-        </Text>
+        <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+          <Text style={styles.detailTitle}>
+            {name} <Text style={styles.detailId}>{pad3(id)}</Text>
+          </Text>
+
+          <TouchableOpacity onPress={() => toggleFavorite(compactGame)} style={styles.detailHeartBtn} activeOpacity={0.8}>
+            <MaterialCommunityIcons name={fav ? 'heart' : 'heart-outline'} size={22} color={fav ? '#ef4444' : '#fff'} />
+          </TouchableOpacity>
+        </View>
+
         {img ? (
           <Image source={{ uri: img }} style={styles.detailImage} resizeMode="cover" />
         ) : (
@@ -393,7 +470,6 @@ function DetailsScreen({ route }) {
         </View>
       ) : details?.game ? (
         <View style={{ paddingHorizontal: 16, paddingVertical: 16 }}>
-          {/* Precio y Comprar */}
           <View style={styles.detailPriceRow}>
             {off ? (
               <>
@@ -414,7 +490,6 @@ function DetailsScreen({ route }) {
             <Text style={styles.buyTxt}>Comprar</Text>
           </TouchableOpacity>
 
-          {/* Info */}
           <Text style={[styles.sectionTitle, { marginTop: 18 }]}>Información</Text>
           <View style={styles.infoGrid}>
             <InfoBlock label="Lanzamiento" value={details.game.released || '—'} />
@@ -441,6 +516,107 @@ function DetailsScreen({ route }) {
   );
 }
 
+// ===== FAVORITES SCREEN =====
+function FavoritesScreen({ navigation }) {
+  const { favorites, toggleFavorite } = useFavorites();
+
+  const renderItem = ({ item }) => {
+    const [c1, c2] = gradientById(item.id);
+    const onBuy = () =>
+      Alert.alert(
+        'Comprar en ENEBO',
+        `${item.name}\n\nPrecio: $${item.finalPrice.toFixed(2)} USD`,
+        [
+          { text: 'Cancelar', style: 'cancel' },
+          { text: 'Confirmar', onPress: () => Alert.alert('¡Listo!', 'Compra simulada 😄') },
+        ]
+      );
+
+    return (
+      <TouchableOpacity
+        activeOpacity={0.9}
+        onPress={() => navigation.navigate('Details', { id: item.id, name: item.name })}
+        style={{ width: CARD_W }}
+      >
+        <View style={styles.card}>
+          <LinearGradient colors={[c1, c2]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.cardBanner}>
+            <View style={styles.metacriticPill}>
+              <MaterialCommunityIcons name="star-circle" size={14} color="#fff" />
+              <Text style={styles.metacriticTxt}>{item.metacritic ?? '—'}</Text>
+            </View>
+            {item.salePct ? (
+              <View style={styles.offerPill}>
+                <MaterialCommunityIcons name="tag" size={12} color="#10b981" />
+                <Text style={styles.offerTxt}>-{item.salePct}%</Text>
+              </View>
+            ) : null}
+            <Text style={styles.cardId}>{pad3(item.id)}</Text>
+          </LinearGradient>
+
+          <View>
+            <Image source={{ uri: item.image }} style={styles.cardImage} resizeMode="cover" />
+            <TouchableOpacity onPress={() => toggleFavorite(item)} activeOpacity={0.8} style={styles.heartBtn}>
+              <MaterialCommunityIcons name="heart" size={20} color="#ef4444" />
+            </TouchableOpacity>
+          </View>
+
+          <View style={styles.cardInfo}>
+            <Text style={styles.cardName} numberOfLines={1}>{item.name}</Text>
+            <Text style={styles.cardReleased} numberOfLines={1}>{item.released || '—'}</Text>
+
+            <View style={styles.priceRow}>
+              {item.salePct ? (
+                <>
+                  <Text style={styles.priceStriked}>${item.price.toFixed(2)}</Text>
+                  <Text style={styles.priceFinal}>${item.finalPrice.toFixed(2)}</Text>
+                </>
+              ) : (
+                <Text style={styles.priceFinal}>${item.finalPrice.toFixed(2)}</Text>
+              )}
+            </View>
+
+            <TouchableOpacity style={styles.buyBtn} onPress={onBuy}>
+              <MaterialCommunityIcons name="cart" size={16} color="#0b0b0e" />
+              <Text style={styles.buyTxt}>Comprar</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </TouchableOpacity>
+    );
+  };
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <LinearGradient colors={['#0f0c29', '#302b63', '#24243e']} start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }} style={styles.headerGrad}>
+        <View style={styles.headerLeft}>
+          <View style={styles.logoCircle}>
+            <MaterialCommunityIcons name="heart" size={20} color="#fff" />
+          </View>
+          <Text style={styles.brandTitle}>Favoritos</Text>
+        </View>
+      </LinearGradient>
+
+      {favorites.length === 0 ? (
+        <View style={{ padding: 24, alignItems: 'center' }}>
+          <Text style={{ color: '#98a2b3', textAlign: 'center' }}>
+            Aún no tienes favoritos. Toca el corazón en cualquier juego para guardarlo aquí.
+          </Text>
+        </View>
+      ) : (
+        <FlatList
+          data={favorites}
+          keyExtractor={(item) => String(item.id)}
+          numColumns={COLS}
+          columnWrapperStyle={{ gap: GAP, paddingHorizontal: H_PADDING }}
+          contentContainerStyle={{ paddingBottom: 24, paddingTop: 8, gap: GAP }}
+          renderItem={renderItem}
+        />
+      )}
+      <StatusBar style="light" />
+    </SafeAreaView>
+  );
+}
+
 // ===== UI bits =====
 function InfoBlock({ label, value }) {
   return (
@@ -454,33 +630,35 @@ function InfoBlock({ label, value }) {
 // ===== Root =====
 export default function App() {
   return (
-    <NavigationContainer>
-      <Stack.Navigator
-        screenOptions={{
-          headerShown: false,
-          contentStyle: { backgroundColor: '#0b0b0e' },
-          animation: Platform.select({ ios: 'default', android: 'fade' }),
-        }}
-      >
-        <Stack.Screen name="Home" component={HomeScreen} />
-        <Stack.Screen
-          name="Details"
-          component={DetailsScreen}
-          options={({ route }) => ({
-            // === Header NATIVO SOLO EN DETALLE ===
-            headerShown: true,
-            title: route.params?.name || 'Detalle',
-            headerTitleAlign: 'center',
-            headerBackTitleVisible: false,
-            headerShadowVisible: false,
-            headerStyle: { backgroundColor: '#fff' },
-            headerTintColor: '#111', // color del icono "<" y texto
-            headerTitleStyle: { fontWeight: '700' },
-            gestureEnabled: true,
-          })}
-        />
-      </Stack.Navigator>
-    </NavigationContainer>
+    <FavoritesProvider>
+      <NavigationContainer>
+        <Stack.Navigator
+          screenOptions={{
+            headerShown: false,
+            contentStyle: { backgroundColor: '#0b0b0e' },
+            animation: Platform.select({ ios: 'default', android: 'fade' }),
+          }}
+        >
+          <Stack.Screen name="Home" component={HomeScreen} />
+          <Stack.Screen
+            name="Details"
+            component={DetailsScreen}
+            options={({ route }) => ({
+              headerShown: true,
+              title: route.params?.name || 'Detalle',
+              headerTitleAlign: 'center',
+              headerBackTitleVisible: false,
+              headerShadowVisible: false,
+              headerStyle: { backgroundColor: '#fff' },
+              headerTintColor: '#111',
+              headerTitleStyle: { fontWeight: '700' },
+              gestureEnabled: true,
+            })}
+          />
+          <Stack.Screen name="Favorites" component={FavoritesScreen} options={{ headerShown: false }} />
+        </Stack.Navigator>
+      </NavigationContainer>
+    </FavoritesProvider>
   );
 }
 
@@ -488,127 +666,78 @@ export default function App() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0b0b0e' },
 
-  // Header
   headerGrad: {
-    paddingTop: 10,
-    paddingBottom: 14,
-    paddingHorizontal: 16,
-    borderBottomLeftRadius: 18,
-    borderBottomRightRadius: 18,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    shadowColor: '#000',
-    shadowOpacity: 0.25,
-    shadowRadius: 10,
-    elevation: 6,
+    paddingTop: 10, paddingBottom: 14, paddingHorizontal: 16,
+    borderBottomLeftRadius: 18, borderBottomRightRadius: 18,
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    shadowColor: '#000', shadowOpacity: 0.25, shadowRadius: 10, elevation: 6,
   },
   headerLeft: { flexDirection: 'row', alignItems: 'center', gap: 10 },
   logoCircle: {
-    width: 34, height: 34, borderRadius: 17,
-    backgroundColor: '#ffffff22',
-    alignItems: 'center', justifyContent: 'center',
-    borderWidth: StyleSheet.hairlineWidth, borderColor: '#ffffff55',
+    width: 34, height: 34, borderRadius: 17, backgroundColor: '#ffffff22',
+    alignItems: 'center', justifyContent: 'center', borderWidth: StyleSheet.hairlineWidth, borderColor: '#ffffff55',
   },
-  brandTitle: {
-    color: '#fff', fontWeight: '900', fontSize: 20, letterSpacing: 0.5,
-  },
+  brandTitle: { color: '#fff', fontWeight: '900', fontSize: 20, letterSpacing: 0.5 },
   headerRight: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   tag: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    paddingHorizontal: 10, paddingVertical: 6,
-    backgroundColor: '#ffffff22',
-    borderRadius: 14,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: '#ffffff44',
+    flexDirection: 'row', alignItems: 'center', gap: 4,
+    paddingHorizontal: 10, paddingVertical: 6, backgroundColor: '#ffffff22',
+    borderRadius: 14, borderWidth: StyleSheet.hairlineWidth, borderColor: '#ffffff44',
   },
   tagTxt: { color: '#fff', fontWeight: '700', fontSize: 12 },
 
-  // Search
-  searchWrap: {
-    marginTop: 12,
-    marginHorizontal: H_PADDING,
-    backgroundColor: '#111827',
-    borderRadius: 12,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: '#1f2937',
-    paddingHorizontal: 10,
-    paddingVertical: Platform.select({ ios: 10, android: 2 }),
-    flexDirection: 'row',
-    alignItems: 'center',
+  favHeaderBtn: {
+    marginLeft: 4, paddingHorizontal: 10, paddingVertical: 6,
+    backgroundColor: '#ffffff22', borderRadius: 14,
+    borderWidth: StyleSheet.hairlineWidth, borderColor: '#ffffff44',
+    position: 'relative',
   },
-  search: {
-    flex: 1,
-    color: '#e5e7eb',
-    fontSize: 16,
-    paddingVertical: 8,
+  favBadge: {
+    position: 'absolute', top: -4, right: -4, backgroundColor: '#ef4444',
+    minWidth: 18, height: 18, borderRadius: 9, paddingHorizontal: 4,
+    alignItems: 'center', justifyContent: 'center',
   },
+  favBadgeTxt: { color: '#fff', fontWeight: '900', fontSize: 10 },
 
-  // Card
+  searchWrap: {
+    marginTop: 12, marginHorizontal: H_PADDING, backgroundColor: '#111827',
+    borderRadius: 12, borderWidth: StyleSheet.hairlineWidth, borderColor: '#1f2937',
+    paddingHorizontal: 10, paddingVertical: Platform.select({ ios: 10, android: 2 }),
+    flexDirection: 'row', alignItems: 'center',
+  },
+  search: { flex: 1, color: '#e5e7eb', fontSize: 16, paddingVertical: 8 },
+
   card: {
-    width: CARD_W,
-    height: CARD_H,
-    backgroundColor: '#0f1222',
-    borderRadius: 14,
-    overflow: 'hidden',
-    marginBottom: GAP,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: '#1f2540',
-    shadowColor: '#000',
-    shadowOpacity: 0.25,
-    shadowRadius: 8,
-    elevation: 4,
+    width: CARD_W, height: CARD_H, backgroundColor: '#0f1222', borderRadius: 14, overflow: 'hidden',
+    marginBottom: GAP, borderWidth: StyleSheet.hairlineWidth, borderColor: '#1f2540',
+    shadowColor: '#000', shadowOpacity: 0.25, shadowRadius: 8, elevation: 4,
   },
   cardBanner: {
-    height: 38,
-    paddingHorizontal: 10,
-    alignItems: 'center',
-    flexDirection: 'row',
-    justifyContent: 'space-between',
+    height: 38, paddingHorizontal: 10, alignItems: 'center', flexDirection: 'row', justifyContent: 'space-between',
   },
   metacriticPill: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    backgroundColor: '#00000033',
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 12,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: '#ffffff55',
+    flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: '#00000033',
+    paddingHorizontal: 8, paddingVertical: 4, borderRadius: 12,
+    borderWidth: StyleSheet.hairlineWidth, borderColor: '#ffffff55',
   },
   metacriticTxt: { color: '#fff', fontWeight: '800', fontSize: 12 },
-
   offerPill: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    backgroundColor: '#062e27',
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 12,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: '#0d9488',
-    position: 'absolute',
-    right: 50,
+    flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: '#062e27',
+    paddingHorizontal: 8, paddingVertical: 4, borderRadius: 12,
+    borderWidth: StyleSheet.hairlineWidth, borderColor: '#0d9488',
+    position: 'absolute', right: 50,
   },
   offerTxt: { color: '#10b981', fontWeight: '800', fontSize: 12 },
-
   cardId: { color: '#fff', fontWeight: '800', opacity: 0.85, fontSize: 12 },
 
-  cardImage: {
-    width: '100%',
-    height: 130,
-    backgroundColor: '#0b0b0e',
+  cardImage: { width: '100%', height: 130, backgroundColor: '#0b0b0e' },
+
+  heartBtn: {
+    position: 'absolute', right: 8, top: 8, backgroundColor: '#00000066',
+    borderRadius: 16, padding: 6, borderWidth: StyleSheet.hairlineWidth, borderColor: '#ffffff55',
   },
 
-  cardInfo: {
-    flex: 1,
-    paddingHorizontal: 10,
-    paddingTop: 8,
-  },
+  cardInfo: { flex: 1, paddingHorizontal: 10, paddingTop: 8 },
   cardName: { color: '#e5e7eb', fontSize: 14, fontWeight: '800' },
   cardReleased: { color: '#94a3b8', fontSize: 12, marginTop: 2 },
 
@@ -617,97 +746,48 @@ const styles = StyleSheet.create({
   priceFinal: { color: '#22c55e', fontWeight: '900' },
 
   buyBtn: {
-    marginTop: 'auto',
-    backgroundColor: '#22c55e',
-    alignSelf: 'flex-start',
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 10,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
+    marginTop: 'auto', backgroundColor: '#22c55e', alignSelf: 'flex-start',
+    paddingVertical: 8, paddingHorizontal: 12, borderRadius: 10, flexDirection: 'row', alignItems: 'center', gap: 6,
   },
   buyTxt: { color: '#0b0b0e', fontWeight: '900' },
 
-  // Buttons / misc
-  retryBtn: {
-    backgroundColor: '#4f46e5',
-    alignSelf: 'flex-start',
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-    borderRadius: 10,
-  },
+  retryBtn: { backgroundColor: '#4f46e5', alignSelf: 'flex-start', paddingVertical: 10, paddingHorizontal: 16, borderRadius: 10 },
   retryTxt: { color: '#fff', fontWeight: '700' },
 
-  // Details
   detailHeader: {
-    paddingHorizontal: 16,
-    paddingTop: 16,
-    paddingBottom: 12,
-    borderBottomLeftRadius: 24,
-    borderBottomRightRadius: 24,
+    paddingHorizontal: 16, paddingTop: 16, paddingBottom: 12,
+    borderBottomLeftRadius: 24, borderBottomRightRadius: 24,
   },
   detailTitle: { fontSize: 26, fontWeight: '900', color: '#fff' },
   detailId: { fontSize: 16, color: '#e2e8f0', opacity: 0.8 },
-  detailImage: {
-    width: '100%',
-    height: 240,
-    marginTop: 12,
-    borderRadius: 12,
-    backgroundColor: '#0b0b0e',
+  detailImage: { width: '100%', height: 240, marginTop: 12, borderRadius: 12, backgroundColor: '#0b0b0e' },
+
+  detailHeartBtn: {
+    padding: 6, borderRadius: 14, borderWidth: StyleSheet.hairlineWidth, borderColor: '#ffffff55', backgroundColor: '#00000033',
   },
 
-  sectionTitle: {
-    color: '#e2e8f0',
-    fontWeight: '900',
-    fontSize: 16,
-    marginBottom: 10,
-  },
+  sectionTitle: { color: '#e2e8f0', fontWeight: '900', fontSize: 16, marginBottom: 10 },
 
-  infoGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 10,
-  },
+  infoGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
   infoBlock: {
-    width: '48%',
-    backgroundColor: '#0f1222',
-    borderRadius: 12,
-    padding: 12,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: '#1f2540',
+    width: '48%', backgroundColor: '#0f1222', borderRadius: 12, padding: 12,
+    borderWidth: StyleSheet.hairlineWidth, borderColor: '#1f2540',
   },
   infoLabel: { color: '#94a3b8', fontWeight: '700', marginBottom: 4, fontSize: 12 },
   infoValue: { color: '#e5e7eb', fontWeight: '800' },
 
   genresWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   genreChip: {
-    backgroundColor: '#1f2540',
-    borderRadius: 14,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: '#2c335b',
+    backgroundColor: '#1f2540', borderRadius: 14, paddingHorizontal: 10, paddingVertical: 6,
+    borderWidth: StyleSheet.hairlineWidth, borderColor: '#2c335b',
   },
   genreTxt: { color: '#cbd5e1', fontWeight: '700', fontSize: 12 },
 
-  // Detalle: precio
-  detailPriceRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-    marginBottom: 12,
-  },
+  detailPriceRow: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 12 },
   offerPillBig: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    backgroundColor: '#062e27',
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 14,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: '#0d9488',
+    flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: '#062e27',
+    paddingHorizontal: 10, paddingVertical: 6, borderRadius: 14,
+    borderWidth: StyleSheet.hairlineWidth, borderColor: '#0d9488',
   },
   offerTxtBig: { color: '#10b981', fontWeight: '900' },
 });
