@@ -11,6 +11,25 @@ import { StatusBar } from 'expo-status-bar';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
+// ⬇️ Firebase
+import { auth, db } from './firebase';
+import {
+  onAuthStateChanged,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  signOut,
+  updateProfile,
+} from 'firebase/auth';
+import {
+  doc,
+  setDoc,
+  onSnapshot,
+  collection,
+  deleteDoc,
+  addDoc,
+  serverTimestamp,
+} from 'firebase/firestore';
+
 const Stack = createNativeStackNavigator();
 
 // ===== Config / APIs =====
@@ -58,8 +77,64 @@ function priceWithSale(base, pct) {
   return parseFloat((base * (1 - pct / 100)).toFixed(2));
 }
 
+/** ======================
+ *       AUTH CONTEXT (Firebase)
+ *  ====================== */
+const AuthContext = createContext(null);
+function useAuth() {
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error('useAuth debe usarse dentro de AuthProvider');
+  return ctx;
+}
+function AuthProvider({ children }) {
+  const [user, setUser] = useState(null);
+  const [booting, setBooting] = useState(true);
+
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, async (fbUser) => {
+      if (!fbUser) {
+        setUser(null);
+        setBooting(false);
+        return;
+      }
+      const profile = {
+        uid: fbUser.uid,
+        email: fbUser.email,
+        name: fbUser.displayName || (fbUser.email ? fbUser.email.split('@')[0] : 'Usuario'),
+      };
+      setUser(profile);
+      setBooting(false);
+    });
+    return unsub;
+  }, []);
+
+  const register = async (name, email, password) => {
+    const cred = await createUserWithEmailAndPassword(auth, email, password);
+    if (name) await updateProfile(cred.user, { displayName: name });
+    await setDoc(doc(db, 'users', cred.user.uid), {
+      email,
+      name: name || email.split('@')[0],
+      createdAt: serverTimestamp(),
+    }, { merge: true });
+  };
+
+  const login = async (email, password) => {
+    await signInWithEmailAndPassword(auth, email, password);
+  };
+
+  const logout = async () => {
+    await signOut(auth);
+  };
+
+  return (
+    <AuthContext.Provider value={{ user, register, login, logout, booting }}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
 /** =========================
- *     FAVORITOS CONTEXT
+ *     FAVORITOS CONTEXT (Firestore + local fallback)
  *  ========================= */
 const FavoritesContext = createContext(null);
 const FAVORITES_KEY = 'FAVORITES_GAMES_V1';
@@ -69,86 +144,102 @@ function useFavorites() {
   if (!ctx) throw new Error('useFavorites debe usarse dentro de FavoritesProvider');
   return ctx;
 }
+function gameToDoc(g) {
+  return {
+    id: g.id,
+    name: g.name,
+    image: g.image,
+    metacritic: g.metacritic ?? null,
+    released: g.released ?? null,
+    price: g.price,
+    salePct: g.salePct ?? null,
+    finalPrice: g.finalPrice,
+  };
+}
 function FavoritesProvider({ children }) {
+  const { user } = useAuth();
   const [favorites, setFavorites] = useState([]);
 
+  // Sin sesión: cargar/guardar en AsyncStorage
   useEffect(() => {
+    if (user) return;
     (async () => {
       try {
         const raw = await AsyncStorage.getItem(FAVORITES_KEY);
-        if (raw) setFavorites(JSON.parse(raw));
-      } catch {}
+        setFavorites(raw ? JSON.parse(raw) : []);
+      } catch {
+        setFavorites([]);
+      }
     })();
-  }, []);
+  }, [user]);
+
   useEffect(() => {
+    if (user) return;
     AsyncStorage.setItem(FAVORITES_KEY, JSON.stringify(favorites)).catch(() => {});
-  }, [favorites]);
+  }, [favorites, user]);
+
+  // Con sesión: escuchar Firestore
+  useEffect(() => {
+    if (!user) return;
+    const colRef = collection(db, 'users', user.uid, 'favorites');
+    const unsub = onSnapshot(colRef, (snap) => {
+      const arr = snap.docs.map((d) => d.data());
+      setFavorites(arr);
+    });
+    return unsub;
+  }, [user?.uid]);
+
+  // Migrar locales → Firestore al iniciar sesión
+  useEffect(() => {
+    (async () => {
+      if (!user) return;
+      const raw = await AsyncStorage.getItem(FAVORITES_KEY);
+      if (!raw) return;
+      const localFavs = JSON.parse(raw);
+      await Promise.all(
+        localFavs.map((g) =>
+          setDoc(
+            doc(db, 'users', user.uid, 'favorites', String(g.id)),
+            { ...gameToDoc(g), addedAt: serverTimestamp() },
+            { merge: true }
+          )
+        )
+      );
+      await AsyncStorage.removeItem(FAVORITES_KEY);
+    })();
+  }, [user?.uid]);
 
   const isFavorite = (id) => favorites.some((f) => f.id === id);
-  const toggleFavorite = (game) => {
-    setFavorites((prev) => {
-      const exists = prev.some((g) => g.id === game.id);
-      if (exists) return prev.filter((g) => g.id !== game.id);
-      return [...prev, {
-        id: game.id, name: game.name, image: game.image, metacritic: game.metacritic,
-        released: game.released, price: game.price, salePct: game.salePct, finalPrice: game.finalPrice,
-      }];
-    });
+
+  const toggleFavorite = async (game) => {
+    if (!user) {
+      setFavorites((prev) => {
+        const exists = prev.some((g) => g.id === game.id);
+        if (exists) return prev.filter((g) => g.id !== game.id);
+        return [...prev, gameToDoc(game)];
+      });
+      return;
+    }
+    const ref = doc(db, 'users', user.uid, 'favorites', String(game.id));
+    if (isFavorite(game.id)) {
+      await deleteDoc(ref);
+    } else {
+      await setDoc(ref, { ...gameToDoc(game), addedAt: serverTimestamp() });
+    }
   };
-  const removeFavorite = (id) => setFavorites((prev) => prev.filter((g) => g.id !== id));
+
+  const removeFavorite = async (id) => {
+    if (!user) {
+      setFavorites((prev) => prev.filter((g) => g.id !== id));
+      return;
+    }
+    await deleteDoc(doc(db, 'users', user.uid, 'favorites', String(id)));
+  };
 
   return (
     <FavoritesContext.Provider value={{ favorites, isFavorite, toggleFavorite, removeFavorite }}>
       {children}
     </FavoritesContext.Provider>
-  );
-}
-
-/** ======================
- *       AUTH CONTEXT
- *  ====================== */
-const AuthContext = createContext(null);
-const AUTH_KEY = 'AUTH_USER_V1';
-
-function useAuth() {
-  const ctx = useContext(AuthContext);
-  if (!ctx) throw new Error('useAuth debe usarse dentro de AuthProvider');
-  return ctx;
-}
-
-function AuthProvider({ children }) {
-  const [user, setUser] = useState(null);
-  const [booting, setBooting] = useState(true);
-
-  useEffect(() => {
-    (async () => {
-      try {
-        const raw = await AsyncStorage.getItem(AUTH_KEY);
-        if (raw) setUser(JSON.parse(raw));
-      } catch {}
-      setBooting(false);
-    })();
-  }, []);
-
-  const login = async (email, password) => {
-    // DEMO: valida formato básico y password con al menos 4 chars
-    if (!email || !email.includes('@')) throw new Error('Email inválido');
-    if (!password || password.length < 4) throw new Error('La contraseña debe tener 4+ caracteres');
-
-    const newUser = { email, name: email.split('@')[0] };
-    setUser(newUser);
-    await AsyncStorage.setItem(AUTH_KEY, JSON.stringify(newUser));
-  };
-
-  const logout = async () => {
-    setUser(null);
-    await AsyncStorage.removeItem(AUTH_KEY);
-  };
-
-  return (
-    <AuthContext.Provider value={{ user, login, logout, booting }}>
-      {children}
-    </AuthContext.Provider>
   );
 }
 
@@ -163,7 +254,7 @@ function HomeScreen({ navigation }) {
   const [error, setError] = useState(null);
   const [showOffers, setShowOffers] = useState(false);
 
-  const { favorites, isFavorite, toggleFavorite } = useFavorites();
+  const { isFavorite, toggleFavorite } = useFavorites();
   const { user } = useAuth();
 
   const fetchGames = async (searchText = '') => {
@@ -236,7 +327,26 @@ function HomeScreen({ navigation }) {
       `${game.name}\n\nPrecio: $${game.finalPrice.toFixed(2)} USD`,
       [
         { text: 'Cancelar', style: 'cancel' },
-        { text: 'Confirmar', onPress: () => Alert.alert('¡Listo!', `Gracias ${user.name} 😄`) },
+        {
+          text: 'Confirmar',
+          onPress: async () => {
+            try {
+              await addDoc(collection(db, 'users', user.uid, 'purchases'), {
+                gameId: game.id,
+                name: game.name,
+                price: game.finalPrice,
+                meta: {
+                  metacritic: game.metacritic ?? null,
+                  released: game.released ?? null,
+                },
+                purchasedAt: serverTimestamp(),
+              });
+              Alert.alert('¡Listo!', `Gracias ${user.name} 😄`);
+            } catch (e) {
+              Alert.alert('Error', 'No se pudo registrar la compra');
+            }
+          }
+        },
       ]
     );
   };
@@ -406,7 +516,6 @@ function HomeHeader({ showOffers, onToggleOffers, navigation, favCount = 0 }) {
       </View>
 
       <View style={styles.headerRight}>
-        {/* Ofertas toggle */}
         <TouchableOpacity
           activeOpacity={0.9}
           onPress={onToggleOffers}
@@ -416,7 +525,7 @@ function HomeHeader({ showOffers, onToggleOffers, navigation, favCount = 0 }) {
           <Text style={[styles.tagTxt, showOffers && { color: '#22c55e' }]}>Ofertas</Text>
         </TouchableOpacity>
 
-        {/* Reemplazo del botón "Top" por Login/Cuenta */}
+        {/* Login/Cuenta */}
         <TouchableOpacity activeOpacity={0.9} style={styles.tag} onPress={onPressAccount}>
           <MaterialCommunityIcons name="account" size={16} color="#fff" />
           <Text style={styles.tagTxt}>{user ? 'Cuenta' : 'Entrar'}</Text>
@@ -464,12 +573,37 @@ function DetailsScreen({ route, navigation }) {
       );
       return;
     }
+    const compactGame = {
+      id, name,
+      metacritic: details?.game?.metacritic ?? null,
+      released: details?.game?.released ?? null,
+      finalPrice,
+    };
     Alert.alert(
       'Comprar en ENEBO',
       `${name}\n\nPrecio: $${finalPrice.toFixed(2)} USD`,
       [
         { text: 'Cancelar', style: 'cancel' },
-        { text: 'Confirmar', onPress: () => Alert.alert('¡Listo!', `Gracias ${user.name} 😄`) },
+        {
+          text: 'Confirmar',
+          onPress: async () => {
+            try {
+              await addDoc(collection(db, 'users', user.uid, 'purchases'), {
+                gameId: compactGame.id,
+                name: compactGame.name,
+                price: compactGame.finalPrice,
+                meta: {
+                  metacritic: compactGame.metacritic,
+                  released: compactGame.released,
+                },
+                purchasedAt: serverTimestamp(),
+              });
+              Alert.alert('¡Listo!', `Gracias ${user.name} 😄`);
+            } catch (e) {
+              Alert.alert('Error', 'No se pudo registrar la compra');
+            }
+          }
+        },
       ]
     );
   };
@@ -671,10 +805,12 @@ function FavoritesScreen({ navigation }) {
 }
 
 /** ======================
- *        LOGIN
+ *        LOGIN (login + registro)
  *  ====================== */
 function LoginScreen({ navigation }) {
-  const { user, login } = useAuth();
+  const { user, register, login } = useAuth();
+  const [mode, setMode] = useState('login'); // 'login' | 'register'
+  const [name, setName] = useState('');
   const [email, setEmail] = useState(user?.email || '');
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
@@ -684,12 +820,16 @@ function LoginScreen({ navigation }) {
     setErr(null);
     try {
       setBusy(true);
-      await login(email.trim(), password);
-      Alert.alert('¡Bienvenido!', 'Sesión iniciada correctamente', [
+      if (mode === 'register') {
+        await register(name.trim(), email.trim(), password);
+      } else {
+        await login(email.trim(), password);
+      }
+      Alert.alert('¡Listo!', mode === 'register' ? 'Cuenta creada' : 'Sesión iniciada', [
         { text: 'OK', onPress: () => navigation.goBack() },
       ]);
     } catch (e) {
-      setErr(e.message || 'Error al iniciar sesión');
+      setErr(e.message || 'Error');
     } finally {
       setBusy(false);
     }
@@ -700,11 +840,24 @@ function LoginScreen({ navigation }) {
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ flex: 1 }}>
         <ScrollView contentContainerStyle={{ padding: 16 }}>
           <LinearGradient colors={['#0f0c29', '#302b63', '#24243e']} style={styles.detailHeader}>
-            <Text style={styles.detailTitle}>Iniciar sesión</Text>
+            <Text style={styles.detailTitle}>{mode === 'register' ? 'Crear cuenta' : 'Iniciar sesión'}</Text>
           </LinearGradient>
 
           <View style={{ marginTop: 16, backgroundColor: '#0f1222', borderRadius: 12, padding: 16, borderWidth: StyleSheet.hairlineWidth, borderColor: '#1f2540' }}>
-            <Text style={{ color: '#94a3b8', marginBottom: 6, fontWeight: '700' }}>Email</Text>
+            {mode === 'register' && (
+              <>
+                <Text style={{ color: '#94a3b8', marginBottom: 6, fontWeight: '700' }}>Nombre</Text>
+                <TextInput
+                  value={name}
+                  onChangeText={setName}
+                  placeholder="Tu nombre"
+                  placeholderTextColor="#6b7280"
+                  style={styles.input}
+                />
+              </>
+            )}
+
+            <Text style={{ color: '#94a3b8', marginTop: 12, marginBottom: 6, fontWeight: '700' }}>Email</Text>
             <TextInput
               value={email}
               onChangeText={setEmail}
@@ -714,6 +867,7 @@ function LoginScreen({ navigation }) {
               placeholderTextColor="#6b7280"
               style={styles.input}
             />
+
             <Text style={{ color: '#94a3b8', marginTop: 12, marginBottom: 6, fontWeight: '700' }}>Contraseña</Text>
             <TextInput
               value={password}
@@ -723,16 +877,23 @@ function LoginScreen({ navigation }) {
               placeholderTextColor="#6b7280"
               style={styles.input}
             />
+
             {err ? <Text style={{ color: '#ff7b7b', marginTop: 10, fontWeight: '700' }}>{err}</Text> : null}
 
-            <TouchableOpacity style={[styles.buyBtn, { alignSelf: 'flex-start', marginTop: 16, paddingHorizontal: 18 }]} onPress={onSubmit} disabled={busy}>
-              {busy ? <ActivityIndicator /> : <MaterialCommunityIcons name="login" size={18} color="#0b0b0e" />}
-              <Text style={styles.buyTxt}>{busy ? 'Ingresando…' : 'Entrar'}</Text>
+            <TouchableOpacity
+              style={[styles.buyBtn, { alignSelf: 'flex-start', marginTop: 16, paddingHorizontal: 18 }]}
+              onPress={onSubmit}
+              disabled={busy}
+            >
+              {busy ? <ActivityIndicator /> : <MaterialCommunityIcons name={mode === 'register' ? 'account-plus' : 'login'} size={18} color="#0b0b0e" />}
+              <Text style={styles.buyTxt}>{busy ? 'Procesando…' : (mode === 'register' ? 'Crear cuenta' : 'Entrar')}</Text>
             </TouchableOpacity>
 
-            <Text style={{ color: '#94a3b8', marginTop: 14, fontSize: 12 }}>
-              Demo: cualquier email válido y una contraseña de 4+ caracteres.
-            </Text>
+            <TouchableOpacity onPress={() => setMode(mode === 'register' ? 'login' : 'register')} style={{ marginTop: 12 }}>
+              <Text style={{ color: '#94a3b8' }}>
+                {mode === 'register' ? '¿Ya tienes cuenta? Inicia sesión' : '¿No tienes cuenta? Regístrate'}
+              </Text>
+            </TouchableOpacity>
           </View>
         </ScrollView>
       </KeyboardAvoidingView>
